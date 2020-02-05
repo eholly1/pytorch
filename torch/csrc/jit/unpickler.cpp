@@ -1,5 +1,8 @@
 #include <ATen/ATen.h>
 #include <ATen/core/Dict.h>
+#ifdef USE_DISTRIBUTED
+#include <torch/csrc/distributed/rpc/rref_context.h>
+#endif
 #include <torch/csrc/jit/function.h>
 #include <torch/csrc/jit/pickler.h>
 #include "unpickler.h"
@@ -503,6 +506,12 @@ void Unpickler::readGlobal(
       });
       stack_.emplace_back(int64_t(globals_.size() - 1));
       return;
+  } else if (module_name == "torch.distributed.rpc" && class_name == "rref") {
+      #ifdef USE_DISTRIBUTED
+        return rebuildRRef();
+      #else
+        TORCH_INTERNAL_ASSERT(false, "RRef unpickling is only supported with the distributed package");
+      #endif
   } else if (module_name == "torch") {
     // Try to manually resolve several global enums
     // NOTE: this does not put a global into the global table,
@@ -575,7 +584,7 @@ void Unpickler::rebuildTensor(bool quantized) {
           std::vector<double> scales = convertList<double>(qparams.at(1));
           std::vector<int64_t> zero_points = convertList<int64_t>(qparams.at(2));
           int64_t axis = qparams.at(3).toInt();
-          result = _empty_per_channel_affine_quantized(
+          result = at::_empty_per_channel_affine_quantized(
               {0},
               at::tensor(scales),
               at::tensor(zero_points),
@@ -602,6 +611,52 @@ void Unpickler::rebuildTensor(bool quantized) {
     stack_.push_back(std::move(result));
   });
 }
+
+#ifdef USE_DISTRIBUTED
+void Unpickler::rebuildRRef() {
+  globals_.emplace_back([this] {
+    // It is the same as how rref is unpickled in python,
+    // see PyRRef::unpickle
+    auto args = stack_.back().toTuple()->elements();
+    stack_.pop_back();
+    TORCH_INTERNAL_ASSERT(
+        args.size() == distributed::rpc::RRefForkData::RFD_TUPLE_SIZE,
+        "Pickled RRefForkData must contain ",
+        distributed::rpc::RRefForkData::RFD_TUPLE_SIZE,
+        " numbers.");
+    auto ownerId = static_cast<int16_t>(
+        args.at(distributed::rpc::RRefForkData::OWNER_IDX).toInt());
+    // const reference will extend the lifetime of the temporary variable
+    const auto& rrefId = distributed::rpc::RRefId(
+        static_cast<int16_t>(
+            args.at(distributed::rpc::RRefForkData::RREFID_ON_IDX).toInt()),
+        static_cast<int64_t>(
+            args.at(distributed::rpc::RRefForkData::RREFID_ID_IDX).toInt()));
+    const auto& forkId = distributed::rpc::RRefId(
+        static_cast<int16_t>(
+            args.at(distributed::rpc::RRefForkData::FORKID_ON_IDX).toInt()),
+        static_cast<int64_t>(
+            args.at(distributed::rpc::RRefForkData::FORKID_ID_IDX).toInt()));
+    auto parent = static_cast<int16_t>(
+        args.at(distributed::rpc::RRefForkData::PARENT_IDX).toInt());
+    const auto& typeStr = static_cast<std::string>(
+        args.at(distributed::rpc::RRefForkData::TYPE_IDX).toStringRef());
+    auto rrefForkData = distributed::rpc::RRefForkData(
+        ownerId, rrefId, forkId, parent, typeStr);
+    auto& ctx = distributed::rpc::RRefContext::getInstance();
+    c10::intrusive_ptr<distributed::rpc::RRef> rref;
+    // TODO get correct type by passing classResolver
+    TypePtr rrefType = PyObjectType::get();
+    rref = ctx.getOrCreateRRef(rrefForkData, rrefType);
+    ctx.notifyOwnerAndParentOfFork(
+        rrefForkData.forkId_, rrefForkData.parent_, rref);
+    stack_.emplace_back(std::move(
+        c10::static_intrusive_pointer_cast<c10::RRefInterface>(rref)));
+  });
+  stack_.emplace_back(int64_t(globals_.size() - 1));
+  return;
+}
+#endif
 
 void Unpickler::readSlowWithBuffer(char *dest, size_t sz) {
   // First, read any partial from buffer (may be 0).
